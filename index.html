@@ -1,15 +1,746 @@
-<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#000000" />
-    <title>Solid App</title>
-  </head>
-  <body>
-    <noscript>You need to enable JavaScript to run this app.</noscript>
-    <div id="root"></div>
+<html>
+  import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInAnonymously, 
+  signInWithCustomToken,
+  onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  doc, 
+  onSnapshot as firebaseOnSnapshot, 
+  setDoc as firebaseSetDoc, 
+  updateDoc as firebaseUpdateDoc, 
+  arrayUnion as firebaseArrayUnion, 
+  arrayRemove as firebaseArrayRemove,
+  collection,
+  getDoc as firebaseGetDoc,
+  deleteDoc as firebaseDeleteDoc,
+  runTransaction as firebaseRunTransaction
+} from 'firebase/firestore';
+import { 
+  Music, Users, RotateCcw, CheckCircle2, Copy, LogOut, Sparkles, Bot, 
+  PauseCircle, PlayCircle, Mic2, Disc, Cpu, Wifi, Radio, ArrowRight, 
+  Layers, Flag, Terminal, XCircle, Lightbulb, Image as ImageIcon, 
+  AlertTriangle, UserPlus, Check, X, Loader2, Edit3, RefreshCw, Undo2, 
+  Timer, Trash2, HelpCircle, BookOpen, AlertCircle, Lock, Unlock, FileText, Download,
+  ScrollText, CloudOff, Globe, BrainCircuit, Volume2, Wand2, Quote, Zap, Activity, Share2,
+  WifiOff, ChevronDown, ChevronUp, AlignLeft, Mic, Play
+} from 'lucide-react';
 
-    <script src="/src/index.tsx" type="module"></script>
-  </body>
-</html>
+// --- ROBUST INITIALIZATION ---
+let app, auth, db, isOffline = false;
+let mockDbState = {}; // Local memory for offline mode
+let mockListeners = new Map(); // Event listeners for offline mode
+
+try {
+  // Try to parse config, default to empty object if fails
+  let firebaseConfig = {};
+  if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+      firebaseConfig = JSON.parse(__firebase_config);
+  }
+  
+  // Attempt initialization
+  if (!firebaseConfig.apiKey) throw new Error("No Config");
+  app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
+} catch (e) {
+  console.warn("Firebase failed to load. Switching to OFFLINE MODE.", e);
+  isOffline = true;
+  // Mock Auth User
+  auth = { currentUser: { uid: 'offline-user', isAnonymous: true } }; 
+}
+
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const ROOM_COLLECTION = 'rooms';
+const SECTION_TYPES = ["VERSE", "CHORUS", "BRIDGE", "PRE-CHORUS", "OUTRO", "INTRO"];
+const TURN_LIMIT_MS = 60000; 
+const IDLE_LIMIT_MS = 300000; 
+
+// --- ENTER API KEY HERE ---
+const apiKey = ""; 
+
+// --- SMART DATA LAYER (Handles Online/Offline transparently) ---
+
+const getPath = (ref) => {
+    if (typeof ref === 'string') return ref;
+    return ref.path || ref.id; 
+};
+
+// 1. Smart Snapshot
+const onSmartSnapshot = (ref, callback) => {
+  if (isOffline) {
+    const path = getPath(ref);
+    if (!mockListeners.has(path)) mockListeners.set(path, new Set());
+    mockListeners.get(path).add(callback);
+    
+    if (mockDbState[path]) {
+        callback({ 
+            exists: () => true, 
+            data: () => mockDbState[path],
+            forEach: (fn) => Object.values(mockDbState).forEach(fn)
+        });
+    } else {
+        if (path.includes(ROOM_COLLECTION)) {
+             callback({ forEach: (fn) => Object.values(mockDbState).forEach(d => fn({ data: () => d, id: d.roomId })) });
+        }
+    }
+    return () => {
+        const set = mockListeners.get(path);
+        if (set) set.delete(callback);
+    };
+  }
+  return firebaseOnSnapshot(ref, callback);
+};
+
+// 2. Smart Set/Update
+const triggerLocalUpdate = (path) => {
+    if (mockListeners.has(path)) {
+        const listeners = mockListeners.get(path);
+        listeners.forEach(cb => cb({ exists: () => true, data: () => mockDbState[path] }));
+    }
+    const collectionPath = path.split('/').slice(0, -1).join('/');
+};
+
+const smartSetDoc = async (ref, data) => {
+  if (isOffline) {
+      const path = getPath(ref);
+      mockDbState[path] = { ...data };
+      triggerLocalUpdate(path);
+      return;
+  }
+  return firebaseSetDoc(ref, data);
+};
+
+const smartUpdateDoc = async (ref, data) => {
+  if (isOffline) {
+      const path = getPath(ref);
+      const existing = mockDbState[path] || {};
+      const merged = { ...existing };
+      Object.keys(data).forEach(k => {
+          if (data[k]?.type === 'union') {
+              merged[k] = [...(existing[k] || []), data[k].val];
+          } else if (data[k]?.type === 'remove') {
+             merged[k] = (existing[k] || []).filter(i => i.id !== data[k].val.id);
+          } else {
+              merged[k] = data[k];
+          }
+      });
+      mockDbState[path] = merged;
+      triggerLocalUpdate(path);
+      return;
+  }
+  return firebaseUpdateDoc(ref, data);
+};
+
+const smartGetDoc = async (ref) => {
+    if (isOffline) {
+        const path = getPath(ref);
+        return { exists: () => !!mockDbState[path], data: () => mockDbState[path] };
+    }
+    return firebaseGetDoc(ref);
+}
+
+const smartDeleteDoc = async (ref) => {
+    if (isOffline) {
+        const path = getPath(ref);
+        delete mockDbState[path];
+        if (mockListeners.has(path)) {
+            mockListeners.get(path).forEach(cb => cb({ exists: () => false }));
+        }
+        return;
+    }
+    return firebaseDeleteDoc(ref);
+}
+
+// 3. Smart Transaction
+const smartRunTransaction = async (db, updateFn) => {
+    if (isOffline) {
+        const fakeTx = {
+            get: async (ref) => smartGetDoc(ref),
+            update: (ref, data) => smartUpdateDoc(ref, data),
+            delete: (ref) => smartDeleteDoc(ref)
+        };
+        return updateFn(fakeTx);
+    }
+    return firebaseRunTransaction(db, updateFn);
+};
+
+const safeArrayUnion = (val) => isOffline ? { type: 'union', val } : firebaseArrayUnion(val);
+const safeArrayRemove = (val) => isOffline ? { type: 'remove', val } : firebaseArrayRemove(val);
+
+
+// --- UTILITIES ---
+
+const callGemini = async (payload, endpoint = "generateContent", model = "gemini-2.5-flash-preview-09-2025") => {
+  if (!apiKey) return { candidates: [{ content: { parts: [{ text: JSON.stringify({ word: "NO_KEY", titles: ["No Key"] }) }] } }] };
+  try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:${endpoint}?key=${apiKey}`;
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      return await response.json();
+  } catch (e) {
+      console.error("Gemini Fail", e);
+      return null;
+  }
+};
+
+const encodeWAV = (samples, sampleRate) => {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const writeString = (v, o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  writeString(view, 0, 'RIFF');
+  view.setUint32(4, 32 + samples.length * 2, true);
+  writeString(view, 8, 'WAVE');
+  writeString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(view, 36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+  let index = 44;
+  for (let i = 0; i < samples.length; i++, index += 2) view.setInt16(index, samples[i], true);
+  return new Blob([view], { type: 'audio/wav' });
+};
+
+const generateRoomId = () => {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let result = '';
+  for (let i = 0; i < 6; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
+  return result;
+};
+
+const safeUpdateUrl = (roomId) => {
+  try {
+    const url = new URL(window.location);
+    if (roomId) url.searchParams.set('room', roomId);
+    else url.searchParams.delete('room');
+    window.history.pushState({}, '', url);
+  } catch (e) {}
+};
+
+// --- COMPONENTS ---
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [roomId, setRoomId] = useState(null);
+  const [loadingAuth, setLoadingAuth] = useState(true);
+
+  useEffect(() => {
+    const initAuth = async () => {
+      if (isOffline) {
+          setTimeout(() => {
+              setUser({ uid: 'offline-player', isAnonymous: true });
+              setLoadingAuth(false);
+          }, 500);
+          return;
+      }
+
+      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+        await signInWithCustomToken(auth, __initial_auth_token);
+      } else {
+        await signInAnonymously(auth);
+      }
+    };
+    initAuth();
+    
+    if (!isOffline) {
+        return onAuthStateChanged(auth, (u) => { if (u) { setUser(u); setLoadingAuth(false); } });
+    }
+  }, []);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('room')) setRoomId(params.get('room'));
+  }, []);
+
+  if (loadingAuth) return <div className="min-h-screen bg-[#020208] flex items-center justify-center font-mono text-cyan-500 animate-pulse uppercase tracking-[0.2em]">Authenticating Signal...</div>;
+
+  return (
+    <div className="min-h-screen bg-[#020208] text-cyan-50 font-sans selection:bg-cyan-500/30">
+        {isOffline && (
+            <div className="fixed top-0 left-0 w-full bg-red-600/20 border-b border-red-500/50 text-red-200 text-[10px] font-black uppercase tracking-[0.3em] text-center py-2 z-[100] flex items-center justify-center gap-2">
+                <WifiOff size={12} /> Offline Mode (Local Simulation)
+            </div>
+        )}
+      {!roomId ? (
+        <MainMenu user={user} setRoomId={setRoomId} />
+      ) : (
+        <GameSession user={user} roomId={roomId} setRoomId={setRoomId} />
+      )}
+    </div>
+  );
+}
+
+function MainMenu({ user, setRoomId }) {
+  const [isCreating, setIsCreating] = useState(false);
+  const [activeRooms, setActiveRooms] = useState([]);
+  const [nickname, setNickname] = useState('');
+  const [manualCode, setManualCode] = useState('');
+
+  useEffect(() => {
+    const roomsRef = collection(db, 'artifacts', appId, 'public', 'data', ROOM_COLLECTION);
+    return onSmartSnapshot(roomsRef, (snapshot) => {
+      const rooms = [];
+      snapshot.forEach((doc) => { 
+          const data = doc.data();
+          if (data.status !== 'finished' && data.isPublic) rooms.push(data); 
+      });
+      setActiveRooms(rooms);
+    });
+  }, []);
+
+  const createRoom = async (withBot = false) => {
+    if (isCreating || !nickname) return;
+    setIsCreating(true);
+    const newCode = generateRoomId();
+    try {
+      const players = [{ id: user.uid, name: (nickname || "Producer").toUpperCase(), color: `hsl(${Math.random() * 360}, 80%, 60%)`, isBot: false, strikes: 0 }];
+      if (withBot) players.push({ id: `bot-${newCode}`, name: "AI-BARD", color: '#0f9', isBot: true, strikes: 0 });
+      
+      const docPath = isOffline 
+        ? `artifacts/${appId}/public/data/${ROOM_COLLECTION}/${newCode}` 
+        : doc(db, 'artifacts', appId, 'public', 'data', ROOM_COLLECTION, newCode);
+
+      await smartSetDoc(isOffline ? docPath : docPath, {
+        status: 'playing', roomId: newCode, createdAt: Date.now(), lastActionAt: Date.now(),
+        players, turnIndex: 0, currentLine: [], songLines: [], currentSectionName: "VERSE 1",
+        isPublic: true, joinRequests: [], mood: "NEUTRAL", producerNotes: "Studio initialized."
+      });
+      safeUpdateUrl(newCode);
+      setRoomId(newCode);
+    } catch (e) { 
+        console.error(e);
+        setIsCreating(false); 
+    }
+  };
+
+  const joinRoom = async (code) => {
+    const roomCode = code || manualCode.toUpperCase();
+    if (!roomCode || !nickname.trim()) return;
+    
+    const docPath = isOffline 
+        ? `artifacts/${appId}/public/data/${ROOM_COLLECTION}/${roomCode}` 
+        : doc(db, 'artifacts', appId, 'public', 'data', ROOM_COLLECTION, roomCode);
+
+    const snap = await smartGetDoc(docPath);
+    if (!snap.exists()) return;
+
+    await smartUpdateDoc(docPath, { joinRequests: safeArrayUnion({ id: user.uid, name: nickname.trim().toUpperCase(), timestamp: Date.now() }) });
+    setRoomId(roomCode);
+    safeUpdateUrl(roomCode);
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-6 relative">
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(0,255,255,0.03)_0%,transparent_70%)] pointer-events-none" />
+      
+      <div className="w-full max-w-6xl z-10 flex flex-col lg:flex-row gap-12">
+        <div className="flex-1 space-y-12 animate-in fade-in slide-in-from-left duration-700">
+          <div>
+            <h1 className="text-8xl md:text-9xl font-black text-white tracking-tighter leading-[0.8]">LYRICAL<br/><span className="text-cyan-400">LAB</span></h1>
+            <p className="mt-4 text-cyan-500/40 text-[10px] font-black uppercase tracking-[0.6em] flex items-center gap-3 italic">
+               <Activity size={14} className="animate-pulse text-cyan-400"/> V7.2 Secure Protocol
+            </p>
+          </div>
+
+          <div className="space-y-8 max-w-lg">
+            <div className="space-y-4">
+                <label className="text-xl md:text-2xl font-black text-cyan-400 uppercase tracking-widest ml-1 flex items-center gap-2">
+                  <span className="bg-cyan-500 text-black px-2 rounded">1</span> Enter Your Rapper Name
+                </label>
+                <input 
+                  type="text" 
+                  placeholder="TYPE NAME..." 
+                  value={nickname} 
+                  onChange={e => setNickname(e.target.value.toUpperCase())} 
+                  className="w-full bg-white/5 border-b-4 border-white/20 focus:border-cyan-500 p-6 text-4xl md:text-5xl font-black outline-none transition-all text-white placeholder:text-white/10 uppercase italic" 
+                  maxLength={12} 
+                  autoFocus
+                />
+            </div>
+            
+            {/* --- IMPROVED START BUTTONS --- */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <button 
+                  disabled={!nickname} 
+                  onClick={() => createRoom(false)} 
+                  className={`py-8 rounded-3xl transition-all font-black text-xs tracking-[0.3em] uppercase group flex flex-col items-center justify-center gap-2 ${!nickname ? 'bg-white/5 text-white/20 cursor-not-allowed border border-white/5' : 'bg-white/10 hover:bg-white/20 border border-white/20 hover:border-cyan-400 text-white'}`}
+              >
+                 <Play size={24} className={!nickname ? 'opacity-20' : 'text-cyan-400'} />
+                 {nickname ? 'Start Studio Session' : 'Enter Name to Unlock'}
+              </button>
+              
+              <button 
+                  disabled={!nickname} 
+                  onClick={() => createRoom(true)} 
+                  className={`py-8 rounded-3xl transition-all font-black text-xs tracking-[0.3em] uppercase text-white flex flex-col items-center justify-center gap-2 ${!nickname ? 'bg-white/5 text-white/20 cursor-not-allowed border border-white/5' : 'bg-cyan-600 hover:bg-cyan-500 shadow-[0_0_30px_rgba(6,182,212,0.4)]'}`}
+              >
+                 <Sparkles size={24} className={!nickname ? 'opacity-20' : 'animate-spin-slow'}/>
+                 {nickname ? 'Start with AI Bot' : 'Enter Name to Unlock'}
+              </button>
+            </div>
+
+            <div className={`flex gap-3 transition-opacity duration-500 ${!nickname ? 'opacity-30 pointer-events-none' : 'opacity-100'}`}>
+                <input type="text" placeholder="CODE" value={manualCode} onChange={e => setManualCode(e.target.value.toUpperCase())} className="w-32 bg-white/5 border border-white/10 rounded-2xl p-4 text-center font-mono font-bold text-cyan-400 text-xl" maxLength={6} />
+                <button onClick={() => joinRoom()} className="flex-grow bg-gray-800 hover:bg-gray-700 text-white rounded-2xl font-black text-xs uppercase tracking-widest border border-white/5 transition-all">Manual Connect</button>
+            </div>
+          </div>
+        </div>
+
+        <div className="w-full lg:w-[450px] flex flex-col gap-6">
+            <div className="bg-black/40 border border-white/10 p-8 rounded-[3rem] backdrop-blur-2xl h-[450px] flex flex-col shadow-2xl">
+              <h2 className="text-[10px] font-black mb-8 flex items-center gap-3 text-cyan-500 tracking-[0.4em] uppercase opacity-50"><Globe size={14}/> Live Frequencies</h2>
+              <div className="overflow-y-auto space-y-4 pr-2 custom-scrollbar flex-1">
+                {activeRooms.map(r => (
+                  <button key={r.roomId} disabled={!nickname} onClick={() => joinRoom(r.roomId)} className={`w-full p-6 bg-white/5 border border-white/5 hover:border-cyan-400/50 hover:bg-white/10 rounded-[2rem] cursor-pointer transition-all flex justify-between items-center group text-left ${!nickname ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                    <div className="space-y-1">
+                       <div className="text-white text-xl font-black tracking-widest">{r.roomId}</div>
+                       <div className="text-[8px] text-white/20 font-black uppercase tracking-widest">{r.players.length} ARTISTS • {r.songLines.length} LINES</div>
+                    </div>
+                    <div className="w-10 h-10 rounded-full border border-white/10 flex items-center justify-center group-hover:bg-cyan-500 group-hover:text-white transition-all">
+                      <ArrowRight size={18} />
+                    </div>
+                  </button>
+                ))}
+                {activeRooms.length === 0 && <div className="text-center py-24 text-white/5 font-black uppercase tracking-[0.5em] text-xs">No Public Signals</div>}
+              </div>
+            </div>
+
+            <div className="bg-cyan-900/10 border border-cyan-500/20 p-6 rounded-3xl backdrop-blur flex items-center gap-4 animate-in fade-in slide-in-from-bottom duration-1000">
+                <div className="p-3 bg-cyan-500 rounded-full text-black"><Share2 size={24}/></div>
+                <div>
+                    <h3 className="text-xs font-black text-white uppercase tracking-widest mb-1">Privacy Shield</h3>
+                    <p className="text-[10px] text-cyan-500/60 leading-tight">To share without revealing your account, download this code and host it on Vercel or Netlify anonymously.</p>
+                </div>
+            </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GameSession({ user, roomId, setRoomId }) {
+  const [gameState, setGameState] = useState(null);
+  const [inputWord, setInputWord] = useState('');
+  const [botThinking, setBotThinking] = useState(false);
+  const [isPlayingAudio, setIsPlayingAudio] = useState(false);
+  const [timeRemaining, setTimeRemaining] = useState(60);
+  const [showSectionMenu, setShowSectionMenu] = useState(false);
+  const lyricsEndRef = useRef(null);
+
+  const getGameRef = () => {
+      return isOffline 
+        ? `artifacts/${appId}/public/data/${ROOM_COLLECTION}/${roomId}`
+        : doc(db, 'artifacts', appId, 'public', 'data', ROOM_COLLECTION, roomId);
+  };
+
+  useEffect(() => {
+    return onSmartSnapshot(getGameRef(), (snap) => {
+      if (snap.exists()) setGameState(snap.data());
+      else setRoomId(null);
+    });
+  }, [roomId]);
+
+  useEffect(() => {
+    lyricsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [gameState?.songLines]);
+
+  useEffect(() => {
+    if (!gameState || gameState.status !== 'playing') return;
+    const heartbeat = setInterval(async () => {
+        const now = Date.now();
+        const elapsed = now - gameState.lastActionAt;
+        if (elapsed > IDLE_LIMIT_MS) { await smartDeleteDoc(getGameRef()); return; }
+        const remaining = Math.max(0, Math.floor((60000 - elapsed) / 1000));
+        setTimeRemaining(remaining);
+        if (remaining === 0 && gameState.players[0].id === user.uid) handleEngineTimeout();
+    }, 1000);
+    return () => clearInterval(heartbeat);
+  }, [gameState]);
+
+  const handleEngineTimeout = async () => {
+      await smartRunTransaction(db, async (tx) => {
+          const s = await tx.get(getGameRef());
+          const d = s.data();
+          let p = [...d.players];
+          const curr = p[d.turnIndex];
+          curr.strikes = (curr.strikes || 0) + 1;
+          if (curr.strikes >= 3) {
+              p.splice(d.turnIndex, 1);
+              if (p.length === 0) { tx.delete(getGameRef()); return; }
+          }
+          if (d.turnIndex === 0) p.push(p.shift());
+          tx.update(getGameRef(), { players: p, turnIndex: 0, lastActionAt: Date.now() });
+      });
+  };
+
+  const submitWord = async () => {
+    if (!inputWord.trim()) return;
+    const word = inputWord.trim().split(' ')[0];
+    await smartRunTransaction(db, async (tx) => {
+        const s = await tx.get(getGameRef());
+        const d = s.data();
+        let p = [...d.players];
+        const me = p.find(x => x.id === user.uid);
+        if (me) me.strikes = 0;
+        
+        const nextIndex = (d.turnIndex + 1) % d.players.length;
+        
+        tx.update(getGameRef(), { 
+            currentLine: safeArrayUnion({ id: Math.random().toString(), text: word, uid: user.uid, isBot: false }), 
+            players: p, turnIndex: nextIndex, lastActionAt: Date.now() 
+        });
+    });
+    setInputWord('');
+  };
+
+  const runBotTurn = async () => {
+    if (botThinking) return;
+    setBotThinking(true);
+    try {
+      const prompt = `Next word for song. Section: ${gameState.currentSectionName}. Current line: ${gameState.currentLine.map(w=>w.text).join(' ')}. Mood: ${gameState.mood}. JSON: {"word":"..."}`;
+      const data = await callGemini({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json" } });
+      let word = "...";
+      try {
+         const res = JSON.parse(data.candidates[0].content.parts[0].text);
+         word = res.word;
+      } catch(e) { console.log("Bot parse fail"); }
+
+      await smartUpdateDoc(getGameRef(), { currentLine: safeArrayUnion({ id: Math.random().toString(), text: word, uid: 'bot', isBot: true }), turnIndex: (gameState.turnIndex + 1) % gameState.players.length, lastActionAt: Date.now() });
+    } catch (e) {} finally { setBotThinking(false); }
+  };
+
+  useEffect(() => {
+    if (gameState?.players[gameState.turnIndex]?.isBot && !botThinking) runBotTurn();
+  }, [gameState]);
+
+  const playVocalReference = async () => {
+    if (isPlayingAudio) return;
+    const text = gameState.songLines.slice(-4).map(l => l.text).join(', ');
+    if (!text) return;
+    setIsPlayingAudio(true);
+    try {
+      const data = await callGemini({
+          contents: [{ parts: [{ text: `Say with rhythm for ${gameState.mood} song: ${text}` }] }],
+          generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } } },
+          model: "gemini-2.5-flash-preview-tts"
+      }, "generateContent", "gemini-2.5-flash-preview-tts");
+      
+      if(data) {
+          const audio = new Audio(URL.createObjectURL(encodeWAV(new Int16Array(Uint8Array.from(atob(data.candidates[0].content.parts[0].inlineData.data), c => c.charCodeAt(0)).buffer), 24000)));
+          audio.onended = () => setIsPlayingAudio(false);
+          audio.play();
+      } else {
+          setIsPlayingAudio(false);
+      }
+    } catch (e) { setIsPlayingAudio(false); }
+  };
+
+  if (!gameState) return null;
+  if (gameState.status === 'finished') return <ResultsView gameState={gameState} leaveGame={() => setRoomId(null)} />;
+
+  const isHost = gameState.players[0].id === user.uid;
+  const isMyTurn = gameState.players[gameState.turnIndex]?.id === user.uid;
+
+  return (
+    <div className="min-h-screen flex flex-col relative overflow-hidden bg-[#020208]">
+      <div className={`fixed inset-0 pointer-events-none transition-all duration-500 z-10 ${timeRemaining < 10 ? 'shadow-[inset_0_0_100px_rgba(239,68,68,0.2)] animate-pulse' : ''}`} />
+
+      {isHost && gameState.joinRequests?.length > 0 && (
+          <div className="fixed top-24 left-6 z-50 space-y-3">
+              {gameState.joinRequests.map(req => (
+                  <div key={req.id} className="bg-[#0a0a1f] border-l-4 border-cyan-400 p-6 rounded-r-[2rem] shadow-2xl animate-in slide-in-from-left w-72 backdrop-blur-xl">
+                      <div className="text-white font-black text-xs mb-3 uppercase tracking-widest">{req.name} CLEARANCE REQUEST</div>
+                      <div className="flex gap-2">
+                          <button onClick={() => smartUpdateDoc(getGameRef(), { players: safeArrayUnion({ id: req.id, name: req.name, color: `hsl(${Math.random()*360},80%,60%)`, isBot: false, strikes: 0 }), joinRequests: safeArrayRemove(req) })} className="flex-1 bg-cyan-600 py-2 rounded-xl"><Check size={18} className="mx-auto"/></button>
+                          <button onClick={() => smartUpdateDoc(getGameRef(), { joinRequests: safeArrayRemove(req) })} className="flex-1 bg-red-900 py-2 rounded-xl"><X size={18} className="mx-auto"/></button>
+                      </div>
+                  </div>
+              ))}
+          </div>
+      )}
+
+      <header className="p-8 flex justify-between items-center bg-black/60 border-b border-white/5 backdrop-blur-2xl z-40 relative">
+        <div className="flex items-center gap-8">
+          <h1 className="font-black text-white tracking-[0.2em] text-3xl italic">LAB<span className="text-cyan-400">.</span></h1>
+          <div className="flex gap-3">
+             <div className="px-4 py-1.5 bg-white/5 rounded-full text-[9px] font-black uppercase tracking-[0.3em] border border-white/10 text-cyan-200">{gameState.roomId}</div>
+             {isHost && (
+                 <button onClick={() => smartUpdateDoc(getGameRef(), { isPublic: !gameState.isPublic })} className={`px-4 py-1.5 rounded-full text-[9px] font-black uppercase border flex items-center gap-2 transition-all ${gameState.isPublic ? 'bg-cyan-500 text-black border-cyan-400' : 'bg-red-500/10 border-red-500/40 text-red-400'}`}>
+                    {gameState.isPublic ? <Unlock size={10}/> : <Lock size={10}/>} {gameState.isPublic ? 'OPEN STUDIO' : 'CLOSED SESSION'}
+                 </button>
+             )}
+          </div>
+        </div>
+        <div className="flex items-center gap-6">
+           <div className={`flex items-center gap-3 font-mono text-xl font-black ${timeRemaining < 10 ? 'text-red-500' : 'text-cyan-500'}`}>
+                <Timer size={24} className={timeRemaining < 10 ? 'animate-bounce' : ''}/> {timeRemaining}s
+           </div>
+           <button onClick={() => setRoomId(null)} className="p-2 text-white/20 hover:text-red-500 transition-colors"><LogOut size={24}/></button>
+        </div>
+      </header>
+
+      <main className="flex-grow flex flex-col items-center justify-center relative">
+        {/* --- LEFT SIDE: LYRICS TELEPROMPTER (RESPONSIVE) --- */}
+        <div className="absolute top-24 left-0 w-full md:w-80 h-32 md:h-auto md:top-24 md:left-6 md:bottom-32 bg-black/40 border-y md:border border-cyan-500/20 md:rounded-3xl backdrop-blur-xl flex flex-col overflow-hidden animate-in slide-in-from-left duration-700 z-30 shadow-[0_0_30px_rgba(0,255,255,0.05)]">
+            <div className="p-2 md:p-4 border-b border-white/5 flex justify-between items-center bg-cyan-900/10">
+                <span className="text-[9px] font-black uppercase tracking-[0.3em] text-cyan-400 flex items-center gap-2"><AlignLeft size={12}/> Teleprompter</span>
+                <span className="flex items-center gap-1 text-[9px] text-red-500 font-black animate-pulse"><div className="w-2 h-2 rounded-full bg-red-500"/> REC</span>
+            </div>
+            <div className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4 md:space-y-6 custom-scrollbar scroll-smooth">
+                {gameState.songLines.length === 0 && <div className="text-white/20 text-[10px] md:text-xs font-black tracking-widest text-center mt-4 md:mt-20 uppercase border border-white/10 p-4 rounded-xl border-dashed">Lyrics will appear here after you click "End Line"</div>}
+                {gameState.songLines.reduce((acc, curr) => {
+                    if (acc.last !== curr.section) acc.els.push(<div key={`h-${curr.section}-${Math.random()}`} className="text-[9px] font-black text-cyan-600/50 uppercase tracking-[0.2em] mb-1 pt-2 md:pt-4 border-t border-white/5 first:border-0 first:pt-0">{curr.section}</div>);
+                    acc.els.push(<p key={acc.els.length} className="text-sm md:text-lg font-serif text-white leading-snug mb-2 font-medium">{curr.text}</p>);
+                    acc.last = curr.section; return acc;
+                }, { last: null, els: [] }).els}
+                <div ref={lyricsEndRef} />
+            </div>
+        </div>
+
+        {/* --- CENTER: GAME CIRCLE --- */}
+        <div className="relative w-[350px] h-[350px] md:w-[650px] md:h-[650px] flex items-center justify-center mt-32 md:mt-0">
+          <div className={`absolute w-64 h-64 md:w-[400px] md:h-[400px] rounded-full bg-[#050510] border border-white/5 backdrop-blur-3xl shadow-[0_0_200px_rgba(0,255,255,0.03)] flex flex-col items-center justify-center text-center p-8 md:p-12 transition-transform ${isMyTurn && timeRemaining < 10 ? 'scale-105' : ''}`}>
+            <span className="text-[10px] text-cyan-500 font-black uppercase tracking-[0.5em] mb-4 md:mb-6 opacity-20">{gameState.currentSectionName}</span>
+            <div className="text-xl md:text-3xl font-serif font-black text-white flex flex-wrap justify-center gap-x-2 md:gap-x-3 gap-y-2 leading-none italic">
+              {gameState.currentLine.map((w, i) => <span key={i} className={w.isBot ? 'text-green-400' : 'text-white'}>{w.text}</span>)}
+              {gameState.currentLine.length === 0 && <span className="text-white/5 animate-pulse uppercase tracking-widest text-sm">Awaiting Word</span>}
+            </div>
+          </div>
+
+          {gameState.players.map((p, idx) => {
+            const angle = (360 / gameState.players.length) * idx - 90;
+            const radius = window.innerWidth < 768 ? 160 : 260;
+            const x = Math.cos((angle * Math.PI) / 180) * radius;
+            const y = Math.sin((angle * Math.PI) / 180) * radius;
+            const isTurn = gameState.turnIndex === idx;
+            return (
+              <div key={p.id} className="absolute transition-all duration-700 ease-out" style={{ transform: `translate(${x}px, ${y}px)`, zIndex: isTurn ? 50 : 10 }}>
+                {isTurn && <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-32 h-32 md:w-40 md:h-40 bg-cyan-400/10 rounded-full animate-ping"/>}
+                <div className={`relative w-16 h-16 md:w-24 md:h-24 rounded-full border-2 bg-black flex flex-col items-center justify-center shadow-2xl transition-all ${isTurn ? 'border-white scale-110 shadow-[0_0_50px_rgba(255,255,255,0.1)]' : 'border-white/10 opacity-30'}`} style={{ borderColor: isTurn ? 'white' : p.color }}>
+                    {p.isBot ? <Bot className="text-green-400" size={24}/> : <span className="text-white font-black text-xl md:text-3xl">{p.name[0]}</span>}
+                    <div className="absolute -bottom-3 flex gap-1">
+                        {[...Array(3)].map((_, i) => <div key={i} className={`w-1.5 h-1.5 md:w-2 md:h-2 rounded-full transition-all ${i < (p.strikes || 0) ? 'bg-red-500 shadow-[0_0_10px_red]' : 'bg-white/10'}`} />)}
+                    </div>
+                </div>
+                <div className="mt-4 md:mt-6 bg-black/60 px-3 py-1 rounded-full text-[8px] md:text-[9px] text-white text-center font-black uppercase tracking-widest border border-white/5">{p.name}</div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="absolute bottom-0 w-full bg-black/80 border-t border-white/5 p-4 md:p-8 backdrop-blur-3xl z-50">
+          <div className="max-w-5xl mx-auto space-y-4 md:space-y-6">
+            {isMyTurn ? (
+              <div className="flex gap-4 md:gap-6 animate-in slide-in-from-bottom duration-500">
+                <input autoFocus value={inputWord} onChange={e => setInputWord(e.target.value.toUpperCase())} onKeyDown={e => e.key === 'Enter' && submitWord()} className="flex-grow bg-white/5 border-2 border-white/10 rounded-[2.5rem] p-4 md:p-8 text-xl md:text-4xl font-black outline-none focus:border-cyan-400 transition-all text-white italic uppercase" placeholder="ADD ONE WORD..." />
+                <button onClick={submitWord} className="px-8 md:px-16 bg-cyan-600 hover:bg-cyan-500 text-white rounded-[2.5rem] font-black text-lg md:text-2xl transition-all shadow-[0_0_50px_rgba(6,182,212,0.3)] uppercase">Send</button>
+              </div>
+            ) : (
+                <div className="text-center py-4 md:py-8 text-white/5 font-black uppercase tracking-[1em] animate-pulse text-sm md:text-xl">Waiting for Producers</div>
+            )}
+
+            <div className="flex flex-col md:flex-row justify-between items-center border-t border-white/5 pt-4 md:pt-6 gap-4 md:gap-0">
+                <div className="flex gap-2 md:gap-3 overflow-x-auto w-full md:w-auto pb-2 md:pb-0 justify-center md:justify-start">
+                    <button onClick={async () => {
+                         const text = gameState.currentLine.map(w => w.text).join(' ');
+                         if (!text) return;
+                         await smartUpdateDoc(getGameRef(), { songLines: safeArrayUnion({ text, section: gameState.currentSectionName }), currentLine: [], lastActionAt: Date.now() });
+                    }} className="px-4 py-2 md:px-6 md:py-3 bg-white/5 hover:bg-white/10 rounded-2xl text-[8px] md:text-[9px] font-black uppercase tracking-widest border border-white/5 transition-all whitespace-nowrap">End Line</button>
+                    
+                    <div className="relative group">
+                        <button onClick={() => setShowSectionMenu(!showSectionMenu)} className="px-4 py-2 md:px-6 md:py-3 bg-white/5 hover:bg-white/10 rounded-2xl text-[8px] md:text-[9px] font-black uppercase tracking-widest border border-white/5 flex items-center gap-2 transition-all whitespace-nowrap">Next Section <Layers size={12}/></button>
+                        {showSectionMenu && (
+                            <div className="absolute bottom-16 left-0 bg-black border-2 border-white/10 p-4 rounded-3xl grid grid-cols-2 gap-2 shadow-2xl z-[100] w-64 animate-in zoom-in">
+                                {SECTION_TYPES.map(s => <button key={s} onClick={async () => {
+                                    const text = gameState.currentLine.map(w => w.text).join(' ');
+                                    const update = { currentSectionName: s, currentLine: [], lastActionAt: Date.now() };
+                                    if (text) update.songLines = safeArrayUnion({ text, section: gameState.currentSectionName });
+                                    await smartUpdateDoc(getGameRef(), update);
+                                    setShowSectionMenu(false);
+                                }} className="p-3 bg-white/5 hover:bg-cyan-500 rounded-xl text-[9px] font-black text-left uppercase">{s}</button>)}
+                            </div>
+                        )}
+                    </div>
+
+                    <button onClick={playVocalReference} className={`px-4 py-2 md:px-6 md:py-3 rounded-2xl border transition-all flex items-center gap-3 whitespace-nowrap ${isPlayingAudio ? 'bg-cyan-500 text-black border-cyan-400' : 'bg-white/5 text-cyan-400 border-white/10 hover:bg-white/10'}`}>
+                        <Volume2 size={14}/> <span className="hidden md:inline text-[9px] font-black uppercase tracking-widest">Perform</span>
+                    </button>
+                </div>
+
+                <div className="flex items-center gap-8 w-full md:w-auto justify-center md:justify-end">
+                    <button onClick={() => smartUpdateDoc(getGameRef(), { status: 'finished' })} className="w-full md:w-auto px-8 py-3 bg-green-600 hover:bg-green-500 text-white rounded-2xl text-[9px] font-black uppercase tracking-widest transition-all shadow-lg whitespace-nowrap">Finalize Master</button>
+                </div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+function ResultsView({ gameState, leaveGame }) {
+  const [titles, setTitles] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    const fetchAIExtras = async () => {
+        setLoading(true);
+        try {
+            const lyrics = gameState.songLines.map(l => l.text).join(' ');
+            const res = await callGemini({ contents: [{ parts: [{ text: `Suggest 3 song titles for: ${lyrics}. JSON: {"titles":["..."]}` }] }], generationConfig: { responseMimeType: "application/json" } });
+            setTitles(JSON.parse(res.candidates[0].content.parts[0].text).titles || []);
+        } catch (e) {} finally { setLoading(false); }
+    };
+    fetchAIExtras();
+  }, []);
+
+  return (
+    <div className="min-h-screen bg-[#020208] flex flex-col items-center p-12 overflow-y-auto animate-in fade-in duration-1000">
+      <div className="w-full max-w-4xl bg-white p-20 rounded-[4rem] shadow-2xl text-black relative border-[20px] border-black">
+        <div className="absolute top-12 right-12 opacity-5"><Disc size={200} className="animate-spin-slow"/></div>
+        <header className="border-b-8 border-black pb-10 mb-16">
+            <h1 className="text-9xl font-black tracking-tighter uppercase leading-[0.8]">MASTER<br/>RECORD</h1>
+            <p className="mt-6 font-black text-xs opacity-40 uppercase tracking-[0.4em]">Lyrical Lab Engineering • Anonymous Studio Uplink</p>
+        </header>
+        <div className="space-y-12 mb-24">
+          {gameState.songLines.reduce((acc, curr) => {
+            if (acc.last !== curr.section) acc.els.push(<div key={`h-${curr.section}`} className="text-[12px] font-black text-cyan-600 uppercase tracking-[0.5em] pt-10 border-b-2 border-black/5 pb-2 mb-6">[{curr.section}]</div>);
+            acc.els.push(<p key={acc.els.length} className="text-4xl font-serif font-black leading-none tracking-tight">{curr.text}</p>);
+            acc.last = curr.section; return acc;
+          }, { last: null, els: [] }).els}
+        </div>
+        <footer className="border-t-4 border-black pt-10 flex justify-between items-end">
+            <div>
+                <p className="text-[10px] font-black uppercase opacity-30 tracking-[0.3em] mb-4">Producers</p>
+                <div className="flex flex-wrap gap-3">
+                    {gameState.players.map(p => <span key={p.id} className="bg-black text-white px-5 py-2 rounded-full text-[11px] font-black uppercase tracking-widest">{p.name}</span>)}
+                </div>
+            </div>
+            <p className="text-[9px] font-black uppercase opacity-20">2025 LAB ENGINEERING</p>
+        </footer>
+      </div>
+
+      <div className="mt-12 w-full max-w-4xl space-y-6">
+        <div className="bg-white/5 border border-white/10 p-12 rounded-[4rem] text-center backdrop-blur-xl">
+            <p className="text-[11px] font-black text-cyan-500 uppercase tracking-[0.6em] mb-8">AI Predicted Charts ✨</p>
+            <div className="flex flex-wrap justify-center gap-8">
+                {loading ? <Loader2 className="animate-spin text-white/20" size={48}/> : titles.map(t => <span key={t} className="text-5xl font-serif italic font-black text-white mix-blend-overlay hover:mix-blend-normal transition-all">"{t}"</span>)}
+            </div>
+        </div>
+        <button onClick={leaveGame} className="w-full py-10 bg-red-600 hover:bg-red-500 text-white rounded-[4rem] font-black text-3xl uppercase tracking-tighter shadow-2xl transition-all">Purge Session & Disconnect</button>
+      </div>
+    </div>
+  );
+}</html>
